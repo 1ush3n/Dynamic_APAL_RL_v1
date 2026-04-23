@@ -394,27 +394,39 @@ def train(args):
             
             # PPO 更新
             if ep % update_every_episodes == 0:
-                metrics = agent.update(memory, env)
-                memory.clear()
-                
-                # --- [新增] 手动线性学习率衰减 (Linear LR Decay) ---
-                # 迫使 PPO 在末期走非常细微的精准步伐 (如果不使用 ScheduleFree)
-                if not getattr(configs, 'use_schedule_free', False):
-                    progress = min(1.0, ep / configs.max_episodes)
-                    min_lr = 1e-6
-                    current_lr = configs.lr - progress * (configs.lr - min_lr)
-                    for param_group in agent.optimizer.param_groups:
-                        param_group['lr'] = current_lr
-                # ----------------------------------------------------
-                
-                for k, v in metrics.items():
-                    writer.add_scalar(k, v, ep)
+                try:
+                    metrics = agent.update(memory, env)
                     
-                # --- [新增] SIL 参数迭代 ---
-                if sil_buffer is not None:
-                    sil_metrics = agent.update_sil(sil_buffer, env)
-                    for k, v in sil_metrics.items():
+                    # --- [新增] 手动线性学习率衰减 (Linear LR Decay) ---
+                    # 迫使 PPO 在末期走非常细微的精准步伐 (如果不使用 ScheduleFree)
+                    if not getattr(configs, 'use_schedule_free', False):
+                        progress = min(1.0, ep / configs.max_episodes)
+                        min_lr = 1e-6
+                        current_lr = configs.lr - progress * (configs.lr - min_lr)
+                        for param_group in agent.optimizer.param_groups:
+                            param_group['lr'] = current_lr
+                    # ----------------------------------------------------
+                    
+                    for k, v in metrics.items():
                         writer.add_scalar(k, v, ep)
+                        
+                    # --- [新增] SIL 参数迭代 ---
+                    if sil_buffer is not None:
+                        sil_metrics = agent.update_sil(sil_buffer, env)
+                        for k, v in sil_metrics.items():
+                            writer.add_scalar(k, v, ep)
+                            
+                except RuntimeError as e:
+                    if "out of memory" in str(e) or "OOM" in str(e):
+                        print(f"\n⚠️ [OOM 防护] 显存不足，自动清理缓存并跳过本轮更新 (Episode {ep})")
+                        import gc
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                    else:
+                        raise e
+                finally:
+                    memory.clear()
                 
             # 定期评估与保存
               # [Validation Strategy]

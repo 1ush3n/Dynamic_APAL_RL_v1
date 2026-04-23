@@ -3,6 +3,7 @@ import torch
 import numpy as np
 import os
 import re
+import networkx as nx
 
 def load_data(file_path):
     """
@@ -75,6 +76,11 @@ def load_data(file_path):
     
     df['demand_workers'] = df['demand_workers'].fillna(1).astype(int)
     df['task_id'] = df['task_id'].astype(str).str.strip()
+    
+    # 增加工时校验：必须非负
+    if (df['duration'] < 0).any():
+        invalid_tasks = df[df['duration'] < 0]['task_id'].tolist()
+        raise ValueError(f"数据错误：以下工序的工时为负数，请检查数据集！{invalid_tasks}")
     
     # [关键] 3. ID 映射 (基于行号)
     # 使用 DataFrame 的 index 作为 internal_id，保证与 Excel 行号严格一致 (0-based)
@@ -186,6 +192,18 @@ def load_data(file_path):
     
     # 去重
     edges = sorted(list(set(edges)))
+    
+    # 拓扑环路校验 (Cyclic Dependency Check)
+    G = nx.DiGraph()
+    G.add_nodes_from(range(len(df)))
+    G.add_edges_from(edges)
+    
+    try:
+        cycles = list(nx.find_cycle(G, orientation="original"))
+        if cycles:
+            raise ValueError(f"数据错误：发现工艺路线存在循环依赖 (Cyclic Dependency)！闭环链路: {cycles}")
+    except nx.NetworkXNoCycle:
+        pass # 图是 DAG，正常
     
     print(f"[DataLoader] 已加载 {len(df)} 个工序.")
     print(f"  根节点(Roots): {len(root_groups)}")

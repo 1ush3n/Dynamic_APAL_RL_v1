@@ -396,7 +396,7 @@ class PPOAgent:
                 state.y_station_mask = s_mask
                 state.y_worker_mask = w_mask
         
-        loader = DataLoader(rebuilt_states, batch_size=self.batch_size, shuffle=True)
+        loader = DataLoader(rebuilt_states, batch_size=self.batch_size, shuffle=True, num_workers=4, pin_memory=True)
         
         # 3. PPO Optimization Loop
         print(f"PPO Update: BatchSize={self.batch_size}, Total Batches={len(loader)}")
@@ -440,7 +440,7 @@ class PPOAgent:
                     combined_task_mask = ~p_mask
                     
                 task_logits = self.policy.task_head(task_x, global_context, mask=combined_task_mask)
-                if torch.isnan(task_logits).any(): task_logits = torch.nan_to_num(task_logits, nan=-1e9)
+                if torch.isnan(task_logits).any(): task_logits = torch.nan_to_num(task_logits, nan=(torch.finfo(task_logits.dtype).min / 2.0))
                 
                 task_dist = Categorical(logits=task_logits)
                 task_lp = task_dist.log_prob(batch.y_task)
@@ -460,7 +460,7 @@ class PPOAgent:
                     curr_s_mask = ~s_p_mask
                 
                 station_logits = self.policy.station_head(sel_task_emb, station_x, mask=curr_s_mask)
-                if torch.isnan(station_logits).any(): station_logits = torch.nan_to_num(station_logits, nan=-1e9)
+                if torch.isnan(station_logits).any(): station_logits = torch.nan_to_num(station_logits, nan=(torch.finfo(station_logits.dtype).min / 2.0))
                 
                 station_dist = Categorical(logits=station_logits)
                 station_lp = station_dist.log_prob(batch.y_station)
@@ -509,7 +509,7 @@ class PPOAgent:
                     if not valid_step.any(): continue
                     
                     logits = self.policy.worker_head.forward_choice(sel_task_emb, worker_x, mask=curr_mask, current_team_emb=current_team_emb)
-                    if torch.isnan(logits).any(): logits = torch.nan_to_num(logits, nan=-1e9)
+                    if torch.isnan(logits).any(): logits = torch.nan_to_num(logits, nan=(torch.finfo(logits.dtype).min / 2.0))
                     
                     dist = Categorical(logits=logits)
                     step_lp = dist.log_prob(torch.clamp(target, min=0)) 
@@ -706,7 +706,7 @@ class PPOAgent:
                 pad = [-1] * (max_team - len(t))
                 rebuilt_states[i].y_team = torch.tensor([t + pad], dtype=torch.long)
             
-            loader = DataLoader(rebuilt_states, batch_size=sil_batch_size, shuffle=False)
+            loader = DataLoader(rebuilt_states, batch_size=sil_batch_size, shuffle=False, num_workers=4, pin_memory=True)
             
             for batch in loader:
                 batch = batch.to(self.device)
@@ -724,7 +724,7 @@ class PPOAgent:
                     combined_task_mask = ~p_mask
                     
                 task_logits = self.policy.task_head(task_x, global_context, mask=combined_task_mask)
-                if torch.isnan(task_logits).any(): task_logits = torch.nan_to_num(task_logits, nan=-1e9)
+                if torch.isnan(task_logits).any(): task_logits = torch.nan_to_num(task_logits, nan=(torch.finfo(task_logits.dtype).min / 2.0))
                 task_dist = Categorical(logits=task_logits)
                 task_lp = task_dist.log_prob(batch.y_task)
                 
@@ -741,7 +741,7 @@ class PPOAgent:
                     curr_s_mask = ~s_p_mask
                     
                 station_logits = self.policy.station_head(sel_task_emb, station_x, mask=curr_s_mask)
-                if torch.isnan(station_logits).any(): station_logits = torch.nan_to_num(station_logits, nan=-1e9)
+                if torch.isnan(station_logits).any(): station_logits = torch.nan_to_num(station_logits, nan=(torch.finfo(station_logits.dtype).min / 2.0))
                 station_dist = Categorical(logits=station_logits)
                 station_lp = station_dist.log_prob(batch.y_station)
                 
@@ -787,7 +787,7 @@ class PPOAgent:
                     if not valid_step.any(): continue
                     
                     logits = self.policy.worker_head.forward_choice(sel_task_emb, worker_x, mask=curr_mask, current_team_emb=current_team_emb)
-                    if torch.isnan(logits).any(): logits = torch.nan_to_num(logits, nan=-1e9)
+                    if torch.isnan(logits).any(): logits = torch.nan_to_num(logits, nan=(torch.finfo(logits.dtype).min / 2.0))
                     
                     dist = Categorical(logits=logits)
                     step_lp = dist.log_prob(torch.clamp(target, min=0)) 
