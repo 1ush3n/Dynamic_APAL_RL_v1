@@ -6,6 +6,8 @@ from torch_geometric.data import Batch
 from torch_geometric.loader import DataLoader
 import math
 import copy
+from typing import Tuple, List, Dict, Optional, Any
+from torch_geometric.data import HeteroData
 from configs import configs
 try:
     from schedulefree import AdamWScheduleFree
@@ -64,7 +66,7 @@ class PPOAgent:
         self.current_step = 0
         
         # 自适应评估新旧策略差距 (KL散度) 的方法在 update 尾部变动 LR。
-    def select_action(self, obs, mask_task=None, mask_station_matrix=None, mask_worker=None, deterministic=False, temperature=1.0, is_eval=False):
+    def select_action(self, obs: HeteroData, mask_task: Optional[torch.Tensor] = None, mask_station_matrix: Optional[torch.Tensor] = None, mask_worker: Optional[torch.Tensor] = None, deterministic: bool = False, temperature: float = 1.0, is_eval: bool = False) -> Tuple[Tuple[int, int, List[int]], float, float, Optional[torch.Tensor]]:
         """
         选择动作 (Select Action)。
         
@@ -292,7 +294,7 @@ class PPOAgent:
             
         return action_tuple, action_logprob.item(), state_value.item(), specific_station_mask, is_invalid_action
 
-    def update(self, memory, env=None):
+    def update(self, memory: Any, env: Any = None) -> Dict[str, float]:
         """
         PPO 更新逻辑。
         
@@ -653,7 +655,7 @@ class PPOAgent:
         }
         return metrics
 
-    def update_sil(self, sil_buffer, env=None):
+    def update_sil(self, sil_buffer: Any, env: Any = None) -> Dict[str, float]:
         """
         Self-Imitation Learning (SIL) Update.
         Samples trajectories from the expert buffer and trains the agent to clone them,

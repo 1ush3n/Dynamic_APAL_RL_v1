@@ -9,33 +9,17 @@ import os
 import pandas as pd
 import heapq
 import networkx as nx 
+import copy
+from typing import Tuple, List, Dict, Optional, Any
 
 # (Removed hardcoded sys.path.append to comply with standard project struct)
 
 from data_loader import load_data
 from configs import configs
+from core.event_engine import Event, EventType, EventQueue
+from core.action_masker import ActionMasker
 
-# Event Definition
-# time: Event occur time
-# type: 'TASK_FINISH'
-# data: {'task_id': int, 'worker_ids': list, 'station_id': int}
-# Event Definition
-class Event:
-    """
-    仿真事件类
-    Attributes:
-        time (float): 事件发生的时间
-        type (str): 事件类型 (目前主要使用 'TASK_FINISH')
-        data (dict): 事件携带的数据 (如 task_id, worker_ids 等)
-    """
-    def __init__(self, time, type, data):
-        self.time = time
-        self.type = type
-        self.data = data
-        
-    def __lt__(self, other):
-        # 用于优先队列的排序，时间小的在前
-        return self.time < other.time
+Action = Tuple[int, int, List[int]]
 
 
 # ---------------------------------------------------------------------------
@@ -85,8 +69,8 @@ class AirLineEnv_Graph(gym.Env):
         self.station_loads = np.zeros(self.num_stations, dtype=float)
         self.station_wall_clock = np.zeros(self.num_stations, dtype=float)
         
-        # 事件队列 (Priority Queue)
-        self.event_queue = []
+        # 事件队列 (Priority Queue Engine)
+        self.event_queue = EventQueue(max_size=10000)
         
         # 解析固定站位约束 (Fixed Station Constraint)
         # 从原始数据中读取 'fixed_station' 列
@@ -226,7 +210,7 @@ class AirLineEnv_Graph(gym.Env):
         # [Feature Upgrade] station base feat + slot_wait_time + relative loads (15 dims)
         self.base_station_x = torch.zeros((self.num_stations, 15))
         
-    def reset(self, randomize_duration=False, randomize_workers=False, seed=None, options=None):
+    def reset(self, randomize_duration: bool = False, randomize_workers: bool = False, seed: Optional[int] = None, options: Optional[dict] = None) -> Tuple[HeteroData, Dict[str, Any]]:
         """
         重置环境状态以开始新的 Episode。
         如果在训练阶段开启 randomize_duration，则按 ±range 对静态工时进行伪装修改。
@@ -281,7 +265,7 @@ class AirLineEnv_Graph(gym.Env):
         self.worker_locks = np.zeros(self.num_workers, dtype=int)
         self.station_loads.fill(0.0)
         self.station_wall_clock.fill(0.0)
-        self.event_queue = []
+        self.event_queue = EventQueue(max_size=10000)
         
         # [Slot Model] - 记录每个站位中各并行工序的预计完成时间，用于计算等待延迟
         # 小顶堆：记录每个站位中各并行工序的预计完成时间，用于计算等待延迟
@@ -291,13 +275,9 @@ class AirLineEnv_Graph(gym.Env):
         self.task_station_map = {} 
         self.task_end_times = -np.ones(self.num_tasks) 
         
-        # 预分配边的内存空间
-        MAX_TS_EDGES = self.num_tasks
-        MAX_TW_EDGES = self.num_tasks * self.num_workers
-        self.edge_ts_mem = torch.zeros((2, MAX_TS_EDGES), dtype=torch.long)
-        self.edge_tw_mem = torch.zeros((2, MAX_TW_EDGES), dtype=torch.long)
-        self.edge_ts_cnt = 0
-        self.edge_tw_cnt = 0
+        self.assigned_tasks = [] 
+        self.task_station_map = {} 
+        self.task_end_times = -np.ones(self.num_tasks)
         
         # 预计算图拓扑 (前驱/后继)
         self.predecessors = {i: [] for i in range(self.num_tasks)}
@@ -520,7 +500,7 @@ class AirLineEnv_Graph(gym.Env):
         
         return max(curr_max, lower_bound)
 
-    def step(self, action):
+    def step(self, action: Action) -> Tuple[HeteroData, float, bool, Dict[str, Any]]:
         """
         执行一步动作。
         Action: (task_id, station_id, team_list)
@@ -587,21 +567,10 @@ class AirLineEnv_Graph(gym.Env):
         
         self.assigned_tasks.append((task_id, station_id, team, start_time, finish_time))
         
-        if station_id != -1: # exclude virtual zero-duration
-            ts_ptr = self.edge_ts_cnt
-            self.edge_ts_mem[0, ts_ptr] = task_id
-            self.edge_ts_mem[1, ts_ptr] = station_id
-            self.edge_ts_cnt += 1
-            
-            for w in team:
-                tw_ptr = self.edge_tw_cnt
-                self.edge_tw_mem[0, tw_ptr] = task_id
-                self.edge_tw_mem[1, tw_ptr] = w
-                self.edge_tw_cnt += 1
-        
+        self.assigned_tasks.append((task_id, station_id, team, start_time, finish_time))
         # 2. 添加事件到队列
-        heapq.heappush(self.event_queue, Event(finish_time, 'TASK_FINISH', 
-                                               {'task_id': task_id, 'worker_ids': team, 'station_id': station_id}))
+        self.event_queue.push(Event(finish_time, EventType.TASK_FINISH, 
+                                    {'task_id': task_id, 'worker_ids': team, 'station_id': station_id}))
         
         # 3. 推进仿真时间 (离散事件引擎)
         self._advance_time()
@@ -640,21 +609,22 @@ class AirLineEnv_Graph(gym.Env):
         """
         while True:
             # 增加队列非空与异常容量断言防护
-            if not self.event_queue:
+            if self.event_queue.is_empty():
                 self.current_time = self.max_time
                 # Queue empty means simulation ends
                 return
             
+            # 由于 EventQueue 内部已控制容量，这里的长度告警可以移除或使用 len()
             if len(self.event_queue) > 10000:
                 print("WARNING: Event queue limit exceeded! Forcing episode end to prevent OOM/Infinite Loop.")
                 self.current_time = self.max_time
-                self.event_queue = []
+                self.event_queue.clear()
                 return
                 
             # 1. 处理所有已到期的事件
-            while self.event_queue and self.event_queue[0].time <= self.current_time + 1e-5:
-                ev = heapq.heappop(self.event_queue)
-                if ev.type == 'TASK_FINISH':
+            while not self.event_queue.is_empty() and self.event_queue.peek().time <= self.current_time + 1e-5:
+                ev = self.event_queue.pop()
+                if ev.type == EventType.TASK_FINISH:
                     tid = ev.data['task_id']
                     sid = ev.data['station_id']
                     # [Slot Model] 释放工位的历史使用记录 (将其从堆中清理)
@@ -686,8 +656,8 @@ class AirLineEnv_Graph(gym.Env):
                     self.assigned_tasks.append((t, -1, [], finish_time, finish_time))
                     
                     # 加入事件队列 (为了统一触发 unlock 逻辑)
-                    heapq.heappush(self.event_queue, Event(finish_time, 'TASK_FINISH', 
-                                                           {'task_id': t, 'worker_ids': [], 'station_id': -1}))
+                    self.event_queue.push(Event(finish_time, EventType.TASK_FINISH, 
+                                                {'task_id': t, 'worker_ids': [], 'station_id': -1}))
                     zero_run_count += 1
                     
             if zero_run_count > 0:
@@ -703,12 +673,12 @@ class AirLineEnv_Graph(gym.Env):
                  break
             
             # 4. 如果没有 Valid 任务，则必须跳跃时间 (交由 _advance_time 内部或外部决定)
-            if not self.event_queue:
+            if self.event_queue.is_empty():
                 # 真正的环境空转末端，退出循环，让外部拿到掩码后再决定是否调用 try_wait_for_resources
                 break
             
             # Jump to next event
-            next_ev = self.event_queue[0]
+            next_ev = self.event_queue.peek()
             self.current_time = next_ev.time
             # 循环会继续处理 next_ev
 
@@ -718,91 +688,20 @@ class AirLineEnv_Graph(gym.Env):
         主动将时间快进到下一个事件发生（释放工人或槽位），然后返回 True。
         如果连未来的事件也没有了，说明发生了真正的死锁，返回 False。
         """
-        if not self.event_queue:
+        if self.event_queue.is_empty():
             return False  # 真正的死锁：无人可用，且也没有人正在干活
             
-        next_ev = self.event_queue[0]
+        next_ev = self.event_queue.peek()
         self.current_time = next_ev.time
         self._advance_time()  # 触发内部事件释放并尝试解锁新任务
         return True
 
-    def get_masks(self):
+    def get_masks(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         生成动作掩码 (Action Masking)。
-        
-        Returns:
-            task_mask: [N], True=Invalid (Masked), False=Valid
-            station_mask: [N, M], True=Invalid
-            worker_mask: [W], True=Invalid
-            
-        逻辑:
-        1. 任务必须 Ready。
-        2. 必须有足够的工人 (具备相应技能 & 当前空闲)。
-        3. 站位必须符合拓扑约束 (<= 前驱的最大站位) - 暂未严格强制，目前主要靠 Fixed Station 约束。
+        逻辑已抽离至 core.action_masker 模块。
         """
-        # 1. Worker Mask (Global)
-        # [Forward Allocation Enable] 不再因为“现在正忙”而掩码。任何时间都可以接新单进入待办队伍。
-        worker_mask_np = np.zeros(self.num_workers, dtype=bool)
-        worker_mask = torch.tensor(worker_mask_np, dtype=torch.bool)
-        
-        # 2. Task Mask
-        task_mask = torch.ones(self.num_tasks, dtype=torch.bool) # Default Invalid
-        station_mask = torch.ones((self.num_tasks, self.num_stations), dtype=torch.bool)
-        
-        ready_indices = np.where(self.task_status == 1)[0]
-        
-        # 使用向量化计算获取空闲技能与锁定状态可用量
-        # 因为所有工人都允许（worker_mask 全 False），所以 free_workers 就是全体工人
-        free_workers_idx = np.arange(self.num_workers)
-        free_skills = self.worker_skill_matrix.numpy() 
-        free_locks = self.worker_locks
-                 
-        for t in ready_indices:
-            # A. 站位约束
-            min_station = 0
-            for p in self.predecessors[t]:
-                p_s = self.task_station_map.get(p, -1)
-                if p_s != -1:
-                    min_station = max(min_station, p_s)
-            
-            fixed = self.fixed_stations[t]
-            
-            # B. 资源约束与站位可行性检查
-            req_skill = int(self.task_static_feat[t, 1].item())
-            req_demand = int(self.task_static_feat[t, 2].item())
-            
-            valid_stations = False
-            max_station = self.max_allowed_stations[t]
-            
-            # 构建该任务合法的备选站位域
-            station_range = [fixed] if fixed != -1 else list(range(min_station, min(self.num_stations, max_station + 1)))
-            
-            # 动态容量硬限制防拥堵 (打破 Argmax 陷入单工位求生的黑洞)
-            max_slots = getattr(configs, 'max_slots_per_station', 15)
-            
-            has_skill = free_skills[:, req_skill] > 0.5
-            
-            for s in station_range:
-                if s < 0 or s >= self.num_stations: continue
-                
-                # 如果该工位正在施工的任务数量超标，则采取物理硬闭环屏蔽
-                if len(self.station_task_finish_times[s]) >= max_slots:
-                    continue 
-
-                # 检查能够支持在这个站位s工作的空闲人员：即 未绑定(0) 或 已经绑定到(s+1) 的人，并且拥有 req_skill
-                compatible_lock = (free_locks == 0) | (free_locks == s + 1)
-                
-                avail = np.sum(compatible_lock & has_skill)
-                
-                if avail >= req_demand:
-                    # 只有当这个特定的站位能凑齐人数时，该站位对该任务才是合法的！
-                    station_mask[t, s] = False
-                    valid_stations = True
-                    
-            if valid_stations:
-                task_mask[t] = False # 如果有至少一个合法的站位能开工，该任务才被视为 Valid
-                    
-        return task_mask, station_mask, worker_mask
+        return ActionMasker(self).get_masks()
 
     def _get_observation(self):
         """
@@ -875,9 +774,18 @@ class AirLineEnv_Graph(gym.Env):
         data['station'].x = station_x
         
         # 4. Dynamic Edges (Assigned To)
-        # 极速视图切片: O(1) 获取所有当前边索引，彻底剥离 Python 列表转换与动态构建张量的 O(N) 原罪!
-        if self.edge_ts_cnt > 0:
-            t_s_edge = self.edge_ts_mem[:, :self.edge_ts_cnt].clone()
+        # 4. Dynamic Edges (Assigned To)
+        ts_src, ts_dst, tw_src, tw_dst = [], [], [], []
+        for t_id, s_id, team, _, _ in self.assigned_tasks:
+            if s_id != -1:
+                ts_src.append(t_id)
+                ts_dst.append(s_id)
+                for w_id in team:
+                    tw_src.append(t_id)
+                    tw_dst.append(w_id)
+                    
+        if ts_src:
+            t_s_edge = torch.tensor([ts_src, ts_dst], dtype=torch.long)
             s_t_edge = torch.stack([t_s_edge[1], t_s_edge[0]], dim=0)
         else:
             t_s_edge = torch.empty((2, 0), dtype=torch.long)
@@ -886,10 +794,10 @@ class AirLineEnv_Graph(gym.Env):
         data['task', 'assigned_to', 'station'].edge_index = t_s_edge
         data['station', 'has_task', 'task'].edge_index = s_t_edge
         
-        if self.edge_tw_cnt > 0:
-             t_w_edge = self.edge_tw_mem[:, :self.edge_tw_cnt].clone()
+        if tw_src:
+            t_w_edge = torch.tensor([tw_src, tw_dst], dtype=torch.long)
         else:
-             t_w_edge = torch.empty((2, 0), dtype=torch.long)
+            t_w_edge = torch.empty((2, 0), dtype=torch.long)
              
         data['task', 'done_by', 'worker'].edge_index = t_w_edge
         
@@ -904,10 +812,7 @@ class AirLineEnv_Graph(gym.Env):
             'station_loads': self.station_loads.copy(),
             'station_wall_clock': self.station_wall_clock.copy(),
             'current_time': self.current_time,
-            'edge_ts_cnt': self.edge_ts_cnt,
-            'edge_tw_cnt': self.edge_tw_cnt,
-            'edge_ts_mem': self.edge_ts_mem[:, :self.edge_ts_cnt].clone() if self.edge_ts_cnt > 0 else torch.empty((2,0), dtype=torch.long),
-            'edge_tw_mem': self.edge_tw_mem[:, :self.edge_tw_cnt].clone() if self.edge_tw_cnt > 0 else torch.empty((2,0), dtype=torch.long),
+            'assigned_tasks': copy.deepcopy(self.assigned_tasks),
             'base_worker_x': self.base_worker_x.clone(),
             'can_do_edge_index': self.obs_data['worker', 'can_do', 'task'].edge_index.clone()
         }
@@ -959,8 +864,17 @@ class AirLineEnv_Graph(gym.Env):
             
         data['station'].x = station_x
         
-        if snapshot['edge_ts_cnt'] > 0:
-            t_s_edge = snapshot['edge_ts_mem'].clone()
+        ts_src, ts_dst, tw_src, tw_dst = [], [], [], []
+        for t_id, s_id, team, _, _ in snapshot['assigned_tasks']:
+            if s_id != -1:
+                ts_src.append(t_id)
+                ts_dst.append(s_id)
+                for w_id in team:
+                    tw_src.append(t_id)
+                    tw_dst.append(w_id)
+                    
+        if ts_src:
+            t_s_edge = torch.tensor([ts_src, ts_dst], dtype=torch.long)
             s_t_edge = torch.stack([t_s_edge[1], t_s_edge[0]], dim=0)
         else:
             t_s_edge = torch.empty((2, 0), dtype=torch.long)
@@ -969,10 +883,10 @@ class AirLineEnv_Graph(gym.Env):
         data['task', 'assigned_to', 'station'].edge_index = t_s_edge
         data['station', 'has_task', 'task'].edge_index = s_t_edge
         
-        if snapshot['edge_tw_cnt'] > 0:
-             t_w_edge = snapshot['edge_tw_mem'].clone()
+        if tw_src:
+            t_w_edge = torch.tensor([tw_src, tw_dst], dtype=torch.long)
         else:
-             t_w_edge = torch.empty((2, 0), dtype=torch.long)
+            t_w_edge = torch.empty((2, 0), dtype=torch.long)
              
         data['task', 'done_by', 'worker'].edge_index = t_w_edge
         
