@@ -267,6 +267,28 @@ class AirLineEnv_Graph(gym.Env):
         self.station_wall_clock.fill(0.0)
         self.event_queue = EventQueue(max_size=10000)
         
+        # [Dynamic Events] 工人缺勤事件注入
+        if getattr(configs, 'enable_dynamic_events', False):
+            prob_base = getattr(configs, 'prob_worker_absent_base', 0.0)
+            
+            # 训练时随机波动概率，测试/推理时使用基础配置
+            if randomize_duration or randomize_workers:
+                prob_max = getattr(configs, 'prob_worker_absent_max', 0.15)
+                p_absent = np.random.uniform(prob_base, max(prob_base, prob_max))
+            else:
+                p_absent = prob_base
+                
+            if p_absent > 0:
+                absent_workers = np.where(np.random.rand(self.num_workers) < p_absent)[0]
+                dur_min = getattr(configs, 'absence_duration_min', 1.0)
+                dur_max = getattr(configs, 'absence_duration_max', 15.0)
+                typical_horizon = 200.0 # 假设典型工程在 200 小时内
+                
+                for w in absent_workers:
+                    leave_time = np.random.uniform(0, typical_horizon)
+                    duration = np.random.uniform(dur_min, dur_max)
+                    self.event_queue.push(Event(leave_time, EventType.WORKER_LEAVE, {'worker_id': int(w), 'duration': float(duration)}))
+        
         # [Slot Model] - 记录每个站位中各并行工序的预计完成时间，用于计算等待延迟
         # 小顶堆：记录每个站位中各并行工序的预计完成时间，用于计算等待延迟
         self.station_task_finish_times = [[] for _ in range(self.num_stations)]
@@ -638,6 +660,16 @@ class AirLineEnv_Graph(gym.Env):
                         if self.completed_preds[succ] == self.num_preds[succ]:
                             if self.task_status[succ] == 0:
                                 self.task_status[succ] = 1 # Ready
+                elif ev.type == EventType.WORKER_LEAVE:
+                    w = ev.data['worker_id']
+                    duration = ev.data['duration']
+                    # 强行推迟可用时间（如果正忙，则等他忙完继续推迟；如果空闲，立即推迟）
+                    self.worker_free_time[w] = max(self.worker_free_time[w], self.current_time) + duration
+                    # 加入回归锚点，防止引擎死锁
+                    self.event_queue.push(Event(self.worker_free_time[w], EventType.WORKER_RETURN, {'worker_id': w}))
+                elif ev.type == EventType.WORKER_RETURN:
+                    # 仅作为时钟锚点，什么也不需要做，ActionMasker 会自动发现他 free 了
+                    pass
             
             # 2. 0工时任务穿透逻辑 (Zero-Duration Penetration)
             # 必须立即处理掉所有 Ready 的 0工时任务

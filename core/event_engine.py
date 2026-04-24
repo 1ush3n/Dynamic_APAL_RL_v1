@@ -5,6 +5,8 @@ from typing import Dict, List, Any
 
 class EventType(Enum):
     TASK_FINISH = "TASK_FINISH"
+    WORKER_LEAVE = "WORKER_LEAVE"
+    WORKER_RETURN = "WORKER_RETURN"
 
 @dataclass(order=True)
 class Event:
