@@ -22,7 +22,7 @@ def find_latest_checkpoint(model_dir):
 def generate_schedule(model_path=None):
     print("--- Generating Schedule (Deterministic) ---")
     
-    data_path = getattr(configs, 'data_file_path', '100.csv')
+    data_path = getattr(configs, 'data_file_path', 'data/290.csv')
     env = AirLineEnv_Graph(data_path=data_path)
     print(f"Dataset: {data_path}")
     
@@ -66,7 +66,7 @@ def generate_schedule(model_path=None):
         task_mask, station_mask, worker_mask = env.get_masks()
         
         # Action (Strictly Greedy for Final Output)
-        action, _, _, _ = agent.select_action(
+        action, _, _, _, _ = agent.select_action(
             state.to(device),
             mask_task=task_mask.to(device),
             mask_station_matrix=station_mask.to(device),
@@ -86,9 +86,7 @@ def generate_schedule(model_path=None):
     # 运行完毕，从环境中直接抽取真实的历史记录
     schedule_log = []
     for (t_id, s_id, team, start_time, end_time) in env.assigned_tasks:
-        if s_id == -1: 
-            continue # 忽略工时为0的虚拟门控/里程碑节点
-            
+        # 包含所有工序，即使是虚拟节点 (s_id == -1)，因为 verifier 需要完整拓扑
         # Try to find original ID if map exists, else use raw internal int
         if hasattr(env, 'raw_data') and 'task_df' in env.raw_data:
             try:
@@ -99,17 +97,16 @@ def generate_schedule(model_path=None):
             original_id = t_id
             
         schedule_log.append({
-            "Task_Internal_ID": t_id,
-            "Task_Original_ID": original_id,
-            "Station": s_id + 1, # 1-based 适应物理站位习惯
-            "Worker": str([w + 1 for w in team]), # 记录班组信息
-            "Start_Time": start_time,
-            "End_Time": end_time,
+            "TaskID": t_id,
+            "StationID": s_id + 1, # 1-based 适应物理站位习惯
+            "Team": str(team), # 记录班组信息 (内部 ID 0-based)
+            "Start": start_time,
+            "End": end_time,
             "Duration": end_time - start_time # 计算出受效率影响的真实工时
         })
         
     df = pd.DataFrame(schedule_log)
-    df = df.sort_values("Start_Time")
+    df = df.sort_values("Start")
     
     out_file = "final_schedule.csv"
     df.to_csv(out_file, index=False)

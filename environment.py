@@ -566,8 +566,6 @@ class AirLineEnv_Graph(gym.Env):
         self.task_station_map[task_id] = station_id
         
         self.assigned_tasks.append((task_id, station_id, team, start_time, finish_time))
-        
-        self.assigned_tasks.append((task_id, station_id, team, start_time, finish_time))
         # 2. 添加事件到队列
         self.event_queue.push(Event(finish_time, EventType.TASK_FINISH, 
                                     {'task_id': task_id, 'worker_ids': team, 'station_id': station_id}))

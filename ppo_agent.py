@@ -417,7 +417,8 @@ class PPOAgent:
             
         final_epoch = self.k_epochs - 1
         kl_meltdown_occurred = False 
-        total_batches_diagnosed = 0 # 用于消除归零毛刺的统计口径
+        total_batches_diagnosed = 0 
+        kl_exceeded_count = 0
         for i_epoch in range(self.k_epochs):
             epoch_kls = []
             for step_idx, batch in enumerate(loader):
@@ -556,7 +557,7 @@ class PPOAgent:
                 hard_limit = self.kl_early_stop
                 
                 if approx_kl.item() > hard_limit:
-                    print(f"      [KL MELTDOWN] Batch {step_idx}: KL={approx_kl.item():.4f} > Limit {hard_limit}. Applying extreme braking (0.01x loss).")
+                    kl_exceeded_count += 1
                     loss_scale = 0.01
 
                 ratios = torch.exp(total_lp - batch.y_logprob.view(-1))
@@ -632,7 +633,10 @@ class PPOAgent:
             if curr_epoch_kl > self.kl_early_stop:
                 print(f"      -> Early stopping at epoch {i_epoch+1} due to reaching max KL: {curr_epoch_kl:.4f}")
                 break
-        
+                
+        if kl_exceeded_count > 0:
+            print(f"      [KL Warning] {kl_exceeded_count}/{total_batches_diagnosed} batches exceeded KL threshold {self.kl_early_stop}. (Extreme Braking Applied)")
+            
         # (已移除冗杂的学习率下降逻辑，完全交给 Schedule-Free 或恒定 LR)
         mean_kl = sum(approx_kls) / len(approx_kls) if approx_kls else 0.0
         
