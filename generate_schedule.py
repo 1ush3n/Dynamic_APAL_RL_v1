@@ -33,7 +33,7 @@ def generate_schedule(model_path=None):
     model = HBGATPN(configs).to(device)
     
     if model_path is None:
-        model_dir = "models"
+        model_dir = "checkpoints"
         model_path = find_latest_checkpoint(model_dir)
         
     if model_path and os.path.exists(model_path):

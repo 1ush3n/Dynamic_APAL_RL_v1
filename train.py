@@ -210,7 +210,7 @@ def train(args):
         
         # 3. 断点续训 (Resume Training)
         start_episode = 1
-        model_dir = "models"
+        model_dir = "checkpoints"
         os.makedirs(model_dir, exist_ok=True)
         checkpoint_path = os.path.join(model_dir, "latest_checkpoint.pth")
         
@@ -467,7 +467,7 @@ def train(args):
                     print(f"NNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNew Best Model Saved! Makespan: {best_makespan}")
                     
                     # [Real-time Tracer] 实时快照抓拍最好成绩的排单策略
-                    trace_dir = "results/eval_traces"
+                    trace_dir = "checkpoints/eval_traces"
                     os.makedirs(trace_dir, exist_ok=True)
                     if best_sch:
                         tasks_data = []
