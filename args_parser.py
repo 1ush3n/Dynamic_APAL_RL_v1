@@ -2,7 +2,7 @@ import argparse
 
 def get_base_parser():
     parser = argparse.ArgumentParser(description="ALB RL Project 基础参数")
-    parser.add_argument('--data_path', type=str, default='data/100.csv', help="数据文件路径（默认: data/100.csv）")
+    parser.add_argument('--data_path', type=str, default='data/290.csv', help="数据文件路径（默认: data/290.csv）")
     parser.add_argument('--seed', type=int, default=42, help="随机种子（保证复现性）")
     parser.add_argument('--max_episodes', type=int, default=3000, help="最大训练轮数（默认: 3000）")
     parser.add_argument('--log_dir', type=str, default='tf-logs', help="日志保存目录（默认: tf-logs）")

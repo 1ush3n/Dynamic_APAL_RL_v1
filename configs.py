@@ -8,7 +8,7 @@ class Config:
     # 路径配置 (Paths)
     # ------------------
     data_dir: str = "data"
-    data_file_path: str = os.path.join("data", "290.csv")
+    data_file_path: str = os.path.join("data", "290.csv") # 默认验证集基准图
     worker_pool_path: str = os.path.join("data", "worker_pool_fixed.csv")
     
     # ------------------
@@ -16,10 +16,10 @@ class Config:
     # ------------------
     n_j: int = 290                       # 任务(工序)数量估计 (Graph Nodes)
     n_m: int = 5                         # 站位数量 (Stations)
-    n_w_max: int = 120                   # 工人池总上限 (最大可配置的工人数量，固定池容量)
-    n_w_min: int = 50                    # 每回合训练随机抽取的最小工人数 (Domain Randomization)
-    n_w: int = 100                        # 每回合训练抽取的最大工人数，及验证(Eval)阶段固定的工人数
-    max_station_capacity_ratio: float = 0.4  # 单个站位最大容许绑定全厂总人数的比例
+    n_w_max: int = 60                   # 工人池总上限 (最大可配置的工人数量，固定池容量)
+    n_w_min: int = 40                    # 每回合训练随机抽取的最小工人数 (Domain Randomization)
+    n_w: int = 50                        # 每回合训练抽取的最大工人数，及验证(Eval)阶段固定的工人数
+    max_station_capacity_ratio: float = 0.8  # 单个站位最大容许绑定全厂总人数的比例
     max_slots_per_station: int = 3        # 每站位同时执行的最大工序数（物理工位槽）
     
     # ------------------
@@ -37,10 +37,20 @@ class Config:
     # ------------------
     # 泛化性与域随机化 (Domain Randomization)
     # ------------------
-    randomize_durations: bool = True      # 是否在训练期间开启工时随机扰动
-    dur_random_range: float = 0.2         # 工时扰动幅度
-    curriculum_episodes: int = 500        # 训练前 N 轮强制关闭所有随机因子
+    train_data_path_or_dir: str = "data/train_mix"        # 290+715 混合训练目录
+    switch_dataset_every_updates: int = 1                 # 频繁切换以增强泛化能力
+    randomize_durations: bool = True                      # 开启随机工时扰动
+    dur_random_range: float = 0.2                         # 扰动幅度
+    curriculum_episodes: int = 0        # 训练前 N 轮强制关闭所有随机因子
     
+    # ------------------
+    # 动态事件 (Dynamic Events)
+    # ------------------
+    enable_dynamic_events: bool = True     # 是否在训练期间开启突发动态事件（域随机化的一部分）
+    prob_worker_absent_base: float = 0.0   # 工人缺勤的基础概率（验证和推理时的默认值）
+    prob_worker_absent_max: float = 0.15   # 训练时最大随机波动的缺勤概率
+    absence_duration_min: float = 1.0      # 缺勤的最短时间 (小时)
+    absence_duration_max: float = 30.0     # 缺勤的最长时间 (小时)
     # ------------------
     # PPO 训练超参数 (PPO Training)
     # ------------------
@@ -58,7 +68,7 @@ class Config:
     c_value: float = 0.5                   # Critic 价值损失权重
     
     r_coef_makespan: float = 1.0           # 宏观目标：Makespan 下班时间推移惩罚
-    deadlock_penalty_makespan: float = 400.0 # 死锁惩罚项
+    deadlock_penalty_multiplier: float = 2.0 # 死锁惩罚项 (相对于理想总完工时间的倍数)
     reward_scale: float = 0.005            # 全局奖励缩放乘数
     
     c_entropy: float = 0.001                

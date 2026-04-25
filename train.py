@@ -144,7 +144,8 @@ def evaluate_model(env, agent, num_runs=1, temperature=None):
             makespans.append(99999.0) 
             balances.append(9999.0)
             # 评估时的奖励衰减也与配置挂钩，设为 4 倍死锁惩罚以示严厉
-            rewards.append(total_reward - (configs.deadlock_penalty_makespan * configs.r_coef_makespan * configs.reward_scale * 4))
+            dynamic_penalty = configs.deadlock_penalty_multiplier * (env.ideal_makespan / env.mean_task_time)
+            rewards.append(total_reward - (dynamic_penalty * configs.r_coef_makespan * configs.reward_scale * 4))
             schedules.append([])
             durations.append(end_time - start_time)
         else:
@@ -174,12 +175,14 @@ def train(args):
         if not os.path.exists(data_path) and os.path.exists(os.path.join(os.getcwd(), data_path)):
              data_path = os.path.join(os.getcwd(), data_path)
              
-        print(f"数据路径: {data_path}")
-        # 固定种子以保证训练环境的一致性 (Determinism)
-        env = AirLineEnv_Graph(data_path=data_path, seed=42)
+        # [Dataset Pool] 训练环境：直接投喂整个多图混合训练集目录
+        train_dir = getattr(configs, 'train_data_path_or_dir', data_path)
+        print(f"训练图纸池 (Dataset Pool): {train_dir}")
+        env = AirLineEnv_Graph(data_path_or_dir=train_dir, seed=42)
         
-        # [Validation] 单独开辟一个确定性验证环境，防止其污染训练轨迹状态
-        eval_env = AirLineEnv_Graph(data_path=data_path, seed=2026)
+        # [Validation] 验证环境：绑定单一的稳定基准图，防止评估基准浮动
+        print(f"基准评估图 (Eval Graph): {data_path}")
+        eval_env = AirLineEnv_Graph(data_path_or_dir=data_path, seed=2026)
         print("环境初始化完成.")
         
         # 2. 初始化设备与模型
@@ -314,8 +317,9 @@ def train(args):
                          continue
 
                      print(f"REAL DEADLOCK (Step {t}): 没有任何合法的任务派发（可能是前置任务全卡死），且未来无待完成事件。")
-                     # 从 configs 读取死锁惩罚时长，计算公式为：惩罚小时数 * 系数 * 缩放
-                     reward = -configs.deadlock_penalty_makespan * configs.r_coef_makespan * configs.reward_scale 
+                     # [Scale Invariance] 动态死锁惩罚：惩罚倍数 * (理想总工时 / 均值工时)
+                     dynamic_penalty = configs.deadlock_penalty_multiplier * (env.ideal_makespan / env.mean_task_time)
+                     reward = -dynamic_penalty * configs.r_coef_makespan * configs.reward_scale 
                      done = True
                      # 将死锁终局的极度惩罚，追加给上一个做出决策的动作
                      if len(memory.rewards) > 0:
@@ -342,7 +346,8 @@ def train(args):
                 
                 # 无效动作的软惩罚
                 if configs.ablation_no_mask and is_invalid:
-                     reward = -configs.deadlock_penalty_makespan * configs.r_coef_makespan * configs.reward_scale 
+                     dynamic_penalty = configs.deadlock_penalty_multiplier * (env.ideal_makespan / env.mean_task_time)
+                     reward = -dynamic_penalty * configs.r_coef_makespan * configs.reward_scale 
                      done = True      # Terminate episode immediately to prevent infinite loops of illegal actions
                      
                      memory.states.append(env.get_state_snapshot()) 
@@ -427,6 +432,15 @@ def train(args):
                         raise e
                 finally:
                     memory.clear()
+                    
+                # [Dataset Pool] 交替课程学习：按设定的 PPO Update 频率切换图纸
+                current_update_count = ep // update_every_episodes
+                if current_update_count % getattr(configs, 'switch_dataset_every_updates', 1) == 0:
+                    if len(env.dataset_pool) > 1:
+                        import random
+                        next_idx = random.randint(0, len(env.dataset_pool) - 1)
+                        env.switch_dataset(next_idx)
+                        print(f"      🔄 [Alternating Training] 已切图至: {env.dataset_pool[next_idx]['file_path']} (Nodes: {env.num_tasks})")
                 
             # 定期评估与保存
               # [Validation Strategy]
