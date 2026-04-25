@@ -1,0 +1,60 @@
+# 尺度不变性 (Scale Invariance) 重构实施计划
+
+你提到的**“尺度不变性”**是深度强化学习在面对不同尺寸/分布的环境进行域随机化（Domain Randomization）和跨数据集泛化（Generalization）时，最为致命也最容易被忽视的盲区。
+
+如果直接输入绝对工时（如除以固定的 `100.0`）或绝对工作量（除以固定的 `1000.0`），当模型遇到整体工时翻倍的新数据集时，网络提取的特征分布会发生严重的**协变量偏移（Covariate Shift）**，导致模型彻底失效。
+
+为了彻底抹平不同数据集规模带来的数值差异，我拟定了以下**全局尺度归一化实施计划**。
+
+## 1. 尺度锚点定义 (Scale Anchors)
+
+我们将在 `environment.py` 的初始化阶段 (`__init__`) 计算出当前数据集的**内生尺度特征**，用作后续一切除法的分母：
+
+* **$T_{base}$ (基础时间尺度)**: 当前图上所有非虚拟工序的**平均加工时间**。
+  $$ T_{base} = \text{mean}(D_i \mid D_i > 0) $$
+* **$L_{base}$ (基础负荷尺度)**: 完美均分情况下的**单站位理论目标工作量**。
+  $$ L_{base} = \frac{\sum (D_i \times \text{需求人数})}{Num\_Stations} $$
+* **$M_{ideal}$ (理想总完工时间)**: 基于最大人员与站位吞吐量的**理论最短周期**。
+
+## 2. 图神经网络特征改造 (Feature Normalization)
+
+将所有的硬编码常数替换为内生尺度特征，使得网络输入的分布永远恒定在合理区间（如 $0 \sim 5$）：
+
+| 模块 | 特征含义 | 当前 (硬编码) | 重构后 (尺度不变) |
+|---|---|---|---|
+| Task | 基础工时 (`base_durations`) | `dur / 100.0` | `dur / T_{base}` |
+| Worker | 预估等待时间 (`wait_times_w`) | `wait / 100.0` | `wait / T_{base}` |
+| Station | 站位物理累积负荷 (`station_loads`) | `loads / 1000.0` | `loads / L_{base}` |
+| Station | 槽位等待时间 (`wait_time_s`) | `wait / 100.0` | `wait / T_{base}` |
+
+*(注意：`station_x` 的相对负荷比例 `sum_loads` 与 `max_load` 由于本身已经是相对占比，故无需更改。)*
+
+## 3. 强化学习奖励函数重塑 (Reward Reshaping)
+
+奖励的尺度必须与特征的尺度同步，否则会导致梯度的方差在不同数据集间剧烈波动。
+
+* **时间流逝惩罚 (`delta_makespan`)**：
+  原本的增量是绝对时间差。重构后，用它除以 $T_{base}$。
+  *物理意义：* “刚才的这个愚蠢决策，让我们损失了相当于 **几个平均任务** 的时间”。
+* **站位负载不均衡惩罚 (`delta_std`)**：
+  原本的增量是绝对方差差异。重构后，用它除以 $L_{base}$。
+  *物理意义：* “偏离理想单站负荷的相对百分比”。
+* **死锁惩罚 (`Deadlock Penalty`)**：
+  废除 `configs.deadlock_penalty_makespan = 400.0` 这个绝对值。
+  改为 `deadlock_penalty_multiplier = 5.0`。
+  *动态惩罚值计算：* $Penalty = - \text{multiplier} \times \frac{M_{ideal}}{T_{base}}$
+  （直接没收相当于好几倍全局理想周期的分值）。
+
+## 4. 实施步骤
+
+1. 在 `configs.py` 废弃 `deadlock_penalty_makespan`，新增 `deadlock_penalty_multiplier`。
+2. 在 `environment.py` 的 `init_hetero_data()` 中计算 $T_{base}$ 和 $L_{base}$ 锚点。
+3. 全局搜索并替换所有的 `/ 100.0` 和 `/ 1000.0` 为锚点除法。
+4. 修改 `step()` 函数中的 `reward` 计算公式。
+
+---
+
+> [!WARNING]
+> **副作用警告**：这项重构会彻底改变网络所观察到的世界特征分布。实施完毕后，你之前使用绝对数值训练出的 `best_model.pth` 将会出现严重的表现退化，**你必须重新开始训练 (Training from scratch)**。
+
+由于你正在布局跨数据集的泛化性训练，这一重构是“破茧成蝶”的必经之路。如果你同意承受重新训练的代价，请给我明确指示，我将立即开始执行代码替换！

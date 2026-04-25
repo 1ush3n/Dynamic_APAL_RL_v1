@@ -144,7 +144,8 @@ def evaluate_model(env, agent, num_runs=1, temperature=None):
             makespans.append(99999.0) 
             balances.append(9999.0)
             # 评估时的奖励衰减也与配置挂钩，设为 4 倍死锁惩罚以示严厉
-            rewards.append(total_reward - (configs.deadlock_penalty_makespan * configs.r_coef_makespan * configs.reward_scale * 4))
+            dynamic_penalty = configs.deadlock_penalty_multiplier * (env.ideal_makespan / env.mean_task_time)
+            rewards.append(total_reward - (dynamic_penalty * configs.r_coef_makespan * configs.reward_scale * 4))
             schedules.append([])
             durations.append(end_time - start_time)
         else:
@@ -314,8 +315,9 @@ def train(args):
                          continue
 
                      print(f"REAL DEADLOCK (Step {t}): 没有任何合法的任务派发（可能是前置任务全卡死），且未来无待完成事件。")
-                     # 从 configs 读取死锁惩罚时长，计算公式为：惩罚小时数 * 系数 * 缩放
-                     reward = -configs.deadlock_penalty_makespan * configs.r_coef_makespan * configs.reward_scale 
+                     # [Scale Invariance] 动态死锁惩罚：惩罚倍数 * (理想总工时 / 均值工时)
+                     dynamic_penalty = configs.deadlock_penalty_multiplier * (env.ideal_makespan / env.mean_task_time)
+                     reward = -dynamic_penalty * configs.r_coef_makespan * configs.reward_scale 
                      done = True
                      # 将死锁终局的极度惩罚，追加给上一个做出决策的动作
                      if len(memory.rewards) > 0:
@@ -342,7 +344,8 @@ def train(args):
                 
                 # 无效动作的软惩罚
                 if configs.ablation_no_mask and is_invalid:
-                     reward = -configs.deadlock_penalty_makespan * configs.r_coef_makespan * configs.reward_scale 
+                     dynamic_penalty = configs.deadlock_penalty_multiplier * (env.ideal_makespan / env.mean_task_time)
+                     reward = -dynamic_penalty * configs.r_coef_makespan * configs.reward_scale 
                      done = True      # Terminate episode immediately to prevent infinite loops of illegal actions
                      
                      memory.states.append(env.get_state_snapshot()) 

@@ -190,13 +190,29 @@ class AirLineEnv_Graph(gym.Env):
         self.is_critical = self._calculate_cpm()
         self.max_allowed_stations = self._calculate_max_allowed_stations()
         
+        # =====================================================================
+        # [Scale Invariance] 尺度锚点定义 (用于抹平跨数据集的绝对数值差异)
+        # =====================================================================
+        # 1. 基础时间尺度 (T_base)
+        valid_durs = dur[dur > 0]
+        self.mean_task_time = torch.mean(valid_durs).item() if len(valid_durs) > 0 else 1.0
+        
+        # 2. 基础负荷尺度 (L_base)
+        self.total_base_workload = torch.sum(dur * demand).item()
+        self.ideal_station_load = self.total_base_workload / max(1, self.num_stations)
+        
+        # 3. 理想总完工时间 (M_ideal)
+        slots = min(configs.n_w_max, self.num_stations * getattr(configs, 'estimated_cmax_station_slots', 1.0))
+        self.ideal_makespan = self.total_base_workload / max(1.0, slots)
+        
         self.base_data = data
         self.obs_data = None # 将在 reset 中 clone
         
         # 预先分配静态底座张量，避免 step 过程中不断进行内存申请
         self.base_task_x = torch.zeros((self.num_tasks, 17))
         # [Domain Randomization] 备份只读的基础工时分布，用于后续加噪
-        self.base_durations = dur.clone() / 100.0  
+        # [Scale Invariance] 使用内生均值时间 T_base 进行归一化，而非硬编码 100.0
+        self.base_durations = dur.clone() / self.mean_task_time  
         self.base_task_x[:, 0:1] = self.base_durations
         
         type_onehot = torch.zeros((self.num_tasks, 10))
@@ -340,12 +356,12 @@ class AirLineEnv_Graph(gym.Env):
             
             # 刷新模型底层观测到的图静态信息区 (Task_x[0])
             self.base_task_x[:, 0:1] = perturbed_durations
-            # 刷新用于仿真计算真实验收时间 (Step duration calculation)
-            self.task_static_feat[:, 0] = (perturbed_durations * 100.0).squeeze()
+            # [Scale Invariance] 刷新用于仿真计算真实验收时间 (Step duration calculation)
+            self.task_static_feat[:, 0] = (perturbed_durations * self.mean_task_time).squeeze()
         else:
             # 安全还原成纯净考题卷子
             self.base_task_x[:, 0:1] = self.base_durations
-            self.task_static_feat[:, 0] = (self.base_durations * 100.0).squeeze()
+            self.task_static_feat[:, 0] = (self.base_durations * self.mean_task_time).squeeze()
             
         # [关键路径计算 (CPM)]
         # 用于后续计算 Blocking Penalty
@@ -600,11 +616,15 @@ class AirLineEnv_Graph(gym.Env):
         delta_makespan = curr_makespan - prev_makespan
         delta_std = curr_std - prev_std
         
+        # [Scale Invariance] Reward Reshaping
+        norm_delta_makespan = delta_makespan / self.mean_task_time
+        norm_delta_std = delta_std / max(1.0, self.ideal_station_load)
+        
         coef_makespan = configs.r_coef_makespan
         coef_std = configs.r_coef_std
         
-        # 将原有的 terminal 扣除分摊到每一步的改变中
-        reward = -(coef_makespan * delta_makespan) - (coef_std * delta_std)
+        # 将原有的 terminal 扣除分摊到每一步的改变中，物理意义为“损失了相当于几个平均任务的时间”
+        reward = -(coef_makespan * norm_delta_makespan) - (coef_std * norm_delta_std)
         
         # 单步奖励硬截断，防止梯度极值爆炸
         reward = np.clip(reward, -50.0, 50.0)
@@ -751,10 +771,10 @@ class AirLineEnv_Graph(gym.Env):
         worker_x = self.base_worker_x.clone()
         
         # [Feature Upgrade: 连续时间特征支撑排队决策]
-        # 计算工人的预估等待时间: max(0, worker_free_time - current_time) / 100.0
+        # 计算工人的预估等待时间: max(0, worker_free_time - current_time) / self.mean_task_time
         wait_times_w = np.maximum(0, self.worker_free_time - self.current_time)
         # Efficiency(0), Skills(1~10), ProjectedWait(11)
-        worker_x[:, 11] = torch.tensor(wait_times_w, dtype=torch.float) / 100.0
+        worker_x[:, 11] = torch.tensor(wait_times_w, dtype=torch.float) / self.mean_task_time
         
         is_free_bool = (self.worker_free_time <= self.current_time)
         worker_x[:, 12] = torch.tensor(is_free_bool, dtype=torch.float)
@@ -769,7 +789,8 @@ class AirLineEnv_Graph(gym.Env):
         
         # 3. Station Features (In-place refresh)
         station_x = self.base_station_x.clone()
-        station_x[:, 0] = torch.tensor(self.station_loads, dtype=torch.float) / 1000.0
+        # [Scale Invariance] 物理累积负荷基于理论均分值归一化，代替死板的 / 1000.0
+        station_x[:, 0] = torch.tensor(self.station_loads, dtype=torch.float) / max(1.0, self.ideal_station_load)
         
         # [Feature Upgrade: Relative Load Competition]
         sum_loads = np.sum(self.station_loads)
@@ -786,7 +807,7 @@ class AirLineEnv_Graph(gym.Env):
                 wait_time_s = max(0, heap[0] - self.current_time)
             else:
                 wait_time_s = 0.0
-            station_x[s, 4] = wait_time_s / 100.0
+            station_x[s, 4] = wait_time_s / self.mean_task_time
             
         # [Feature Upgrade] Macro Strategic Features for Path Planning
         global_mobile_count = np.sum(self.worker_locks == 0)
@@ -863,7 +884,7 @@ class AirLineEnv_Graph(gym.Env):
         
         # [Feature Upgrade: Wait time rebuild]
         wait_times_w = np.maximum(0, snapshot['worker_free_time'] - snapshot['current_time'])
-        worker_x[:, 11] = torch.tensor(wait_times_w, dtype=torch.float) / 100.0
+        worker_x[:, 11] = torch.tensor(wait_times_w, dtype=torch.float) / self.mean_task_time
         
         is_free_bool = (snapshot['worker_free_time'] <= snapshot['current_time'])
         worker_x[:, 12] = torch.tensor(is_free_bool, dtype=torch.float)
@@ -877,7 +898,7 @@ class AirLineEnv_Graph(gym.Env):
         data['worker', 'can_do', 'task'].edge_index = snapshot['can_do_edge_index'].clone()
         
         station_x = self.base_station_x.clone()
-        station_x[:, 0] = torch.tensor(snapshot['station_loads'], dtype=torch.float) / 1000.0
+        station_x[:, 0] = torch.tensor(snapshot['station_loads'], dtype=torch.float) / max(1.0, self.ideal_station_load)
         
         # [Feature Upgrade: Wait time rebuild]
         max_slots = getattr(configs, 'max_slots_per_station', 15)

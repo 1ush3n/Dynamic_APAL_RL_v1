@@ -66,7 +66,7 @@ class Config:
     c_value: float = 0.5                   # Critic 价值损失权重
     
     r_coef_makespan: float = 1.0           # 宏观目标：Makespan 下班时间推移惩罚
-    deadlock_penalty_makespan: float = 400.0 # 死锁惩罚项
+    deadlock_penalty_multiplier: float = 2.0 # 死锁惩罚项 (相对于理想总完工时间的倍数)
     reward_scale: float = 0.005            # 全局奖励缩放乘数
     
     c_entropy: float = 0.001                
