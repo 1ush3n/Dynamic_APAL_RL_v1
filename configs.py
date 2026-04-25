@@ -8,7 +8,7 @@ class Config:
     # 路径配置 (Paths)
     # ------------------
     data_dir: str = "data"
-    data_file_path: str = os.path.join("data", "290.csv")
+    data_file_path: str = os.path.join("data", "290.csv") # 默认验证集基准图
     worker_pool_path: str = os.path.join("data", "worker_pool_fixed.csv")
     
     # ------------------
@@ -37,8 +37,10 @@ class Config:
     # ------------------
     # 泛化性与域随机化 (Domain Randomization)
     # ------------------
-    randomize_durations: bool = True      # 是否在训练期间开启工时随机扰动
-    dur_random_range: float = 0.2         # 工时扰动幅度
+    train_data_path_or_dir: str = "data/train_mix"        # 290+715 混合训练目录
+    switch_dataset_every_updates: int = 1                 # 频繁切换以增强泛化能力
+    randomize_durations: bool = True                      # 开启随机工时扰动
+    dur_random_range: float = 0.2                         # 扰动幅度
     curriculum_episodes: int = 0        # 训练前 N 轮强制关闭所有随机因子
     
     # ------------------

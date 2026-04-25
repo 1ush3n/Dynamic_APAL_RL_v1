@@ -38,68 +38,125 @@ class AirLineEnv_Graph(gym.Env):
     # Gymnasium Metadata
     metadata = {"render_modes": ["human"], "render_fps": 10}
     
-    def __init__(self, data_path="工序约束_50.xlsx", seed=None, render_mode=None):
+    def __init__(self, data_path_or_dir="工序约束_50.xlsx", seed=None, render_mode=None):
         super().__init__()
         self.render_mode = render_mode
         
         # 设置随机种子以保证环境复现性 (Determinism)
-        # 这对于验证集评估至关重要
         if seed is not None:
             np.random.seed(seed)
-            # torch.manual_seed(seed) # 如果涉及 torch 的随机生成，也应设置
         
-        # 加载数据
-        self.raw_data = load_data(data_path)
-        self.num_tasks = self.raw_data['num_tasks']
         self.num_workers = configs.n_w
         self.num_stations = configs.n_m
         
-        # 动作空间: Tuple(Task, Station, Worker_List_Leader, Num_Workers)
-        # 注意: 标准 Gym 不支持变长动作，这里定义为多离散空间仅作示意。
-        # 实际 Agent (PPOAgent) 会处理具体的动作解码。
-        self.action_space = spaces.MultiDiscrete([self.num_tasks, self.num_stations, self.num_workers])
+        # [Dataset Pool] 扫描输入路径，构建图纸骨架池
+        self.dataset_pool = []
         
-        # 状态变量初始化
-        self.current_time = 0.0
-        # 任务状态: 0=不可用(Not Ready), 1=就绪(Ready), 2=已调度(Scheduled)
-        self.task_status = np.zeros(self.num_tasks, dtype=int) 
-        self.worker_free_time = np.zeros(self.num_workers, dtype=float) 
-        # 工人定岗状态: 0=机动人员(未绑定), 1..num_stations=已绑定站位
-        self.worker_locks = np.zeros(self.num_workers, dtype=int)
-        self.station_loads = np.zeros(self.num_stations, dtype=float)
-        self.station_wall_clock = np.zeros(self.num_stations, dtype=float)
+        if os.path.isdir(data_path_or_dir):
+            # 扫描目录下所有的 csv 和 xlsx
+            files = [os.path.join(data_path_or_dir, f) for f in os.listdir(data_path_or_dir) 
+                     if f.endswith('.csv') or f.endswith('.xlsx')]
+            if not files:
+                raise ValueError(f"目录 {data_path_or_dir} 中未找到任何 csv 或 xlsx 文件。")
+            for f in files:
+                self._load_and_build_context(f)
+        else:
+            self._load_and_build_context(data_path_or_dir)
+            
+        # 初始化激活索引
+        self.active_dataset_idx = 0
+        self.switch_dataset(0)
+        
+        # 动作空间: Tuple(Task, Station, Worker_List_Leader, Num_Workers)
+        self.action_space = spaces.MultiDiscrete([self.num_tasks, self.num_stations, self.num_workers])
         
         # 事件队列 (Priority Queue Engine)
         self.event_queue = EventQueue(max_size=10000)
         
+    def _load_and_build_context(self, file_path):
+        """预加载并将图骨架打包成上下文字典"""
+        raw_data = load_data(file_path)
+        ctx = {'file_path': file_path, 'raw_data': raw_data, 'num_tasks': raw_data['num_tasks']}
+        self.dataset_pool.append(ctx)
+        
+    def switch_dataset(self, idx: int):
+        """无缝切换激活的图骨架"""
+        self.active_dataset_idx = idx
+        ctx = self.dataset_pool[idx]
+        
+        # 1. 设置当前环境的激活骨架 (兼容后续依赖 self.raw_data 的逻辑)
+        self.raw_data = ctx['raw_data']
+        self.num_tasks = ctx['num_tasks']
+        
+        # 2. 如果该数据集尚未执行过初始化，则触发全套张量构建
+        if 'base_data' not in ctx:
+            self._build_static_context(ctx)
+            
+        # 3. 将激活上下文的属性挂载到当前环境实例，保持向下兼容
+        self.base_data = ctx['base_data']
+        self.base_task_x = ctx['base_task_x']
+        self.base_worker_x = ctx['base_worker_x']
+        self.base_station_x = ctx['base_station_x']
+        self.task_static_feat = ctx['task_static_feat']
+        self.worker_skill_matrix = ctx['worker_skill_matrix']
+        self.predecessors = ctx['predecessors']
+        self.successors = ctx['successors']
+        self.num_preds = ctx['num_preds']
+        self.fixed_stations = ctx['fixed_stations']
+        self.mean_task_time = ctx['mean_task_time']
+        self.ideal_station_load = ctx['ideal_station_load']
+        self.ideal_makespan = ctx['ideal_makespan']
+        self.total_base_workload = ctx['total_base_workload']
+        self.base_durations = ctx['base_durations']
+        
+        # 状态变量初始化
+        self.current_time = 0.0
+        self.task_status = np.zeros(self.num_tasks, dtype=int) 
+        self.worker_free_time = np.zeros(self.num_workers, dtype=float) 
+        self.worker_locks = np.zeros(self.num_workers, dtype=int)
+        self.station_loads = np.zeros(self.num_stations, dtype=float)
+        self.station_wall_clock = np.zeros(self.num_stations, dtype=float)
+        
+    def _build_static_context(self, ctx):
+        """巧妙利用原有的 init_hetero_data 逻辑，并将产生的属性打包进 ctx"""
         # 解析固定站位约束 (Fixed Station Constraint)
-        # 从原始数据中读取 'fixed_station' 列
         self.fixed_stations = -np.ones(self.num_tasks, dtype=int)
         if 'fixed_station' in self.raw_data['task_df'].columns:
             for idx, val in enumerate(self.raw_data['task_df']['fixed_station']):
                 if pd.isna(val): continue
-                # 解析逻辑: 支持 "Station 1", "S1", "1" 等格式
                 s_idx = -1
                 try:
                     val_str = str(val).lower().strip()
                     if val_str.startswith('station'):
                          s_idx = int(float(val_str.split()[-1])) - 1
-                    elif val_str.startswith('s'): # S1, S2...
+                    elif val_str.startswith('s'):
                          s_idx = int(float(val_str[1:])) - 1
                     else:
-                         s_idx = int(float(val_str)) - 1 # 假设 Excel 中是 1-based index
+                         s_idx = int(float(val_str)) - 1 
                 except:
                     pass
-                
                 if 0 <= s_idx < self.num_stations:
                     self.fixed_stations[idx] = s_idx
-        
-        # 初始化异构图数据结构
+                    
+        # 复用原有的庞大初始化逻辑
         self.init_hetero_data()
         
-        # 计算全局基底工时总量，用于 [站位工时过载掩码]
-        # (因为实际运行时有技能加成等，只用 Base duration 估算一个大概的上限)
-        self.total_base_workload = torch.sum(self.task_static_feat[:, 0] * self.task_static_feat[:, 2]).item()
+        # 将生成的张量打包进 ctx
+        ctx['base_data'] = self.base_data
+        ctx['base_task_x'] = self.base_task_x
+        ctx['base_worker_x'] = self.base_worker_x
+        ctx['base_station_x'] = self.base_station_x
+        ctx['task_static_feat'] = self.task_static_feat
+        ctx['worker_skill_matrix'] = self.worker_skill_matrix
+        ctx['predecessors'] = self.predecessors
+        ctx['successors'] = self.successors
+        ctx['num_preds'] = self.num_preds
+        ctx['fixed_stations'] = self.fixed_stations
+        ctx['mean_task_time'] = self.mean_task_time
+        ctx['ideal_station_load'] = self.ideal_station_load
+        ctx['ideal_makespan'] = self.ideal_makespan
+        ctx['total_base_workload'] = self.total_base_workload
+        ctx['base_durations'] = self.base_durations
         
     def init_hetero_data(self):
         """
@@ -187,7 +244,7 @@ class AirLineEnv_Graph(gym.Env):
         self.num_preds = np.array([len(self.predecessors[i]) for i in range(self.num_tasks)])
         
         # 计算全局的关键路径和最晚允许站位 (持久化静态特征，只计算一次)
-        self.is_critical = self._calculate_cpm()
+        self.is_critical, cpm_makespan = self._calculate_cpm()
         self.max_allowed_stations = self._calculate_max_allowed_stations()
         
         # =====================================================================
@@ -202,8 +259,10 @@ class AirLineEnv_Graph(gym.Env):
         self.ideal_station_load = self.total_base_workload / max(1, self.num_stations)
         
         # 3. 理想总完工时间 (M_ideal)
-        slots = min(configs.n_w_max, self.num_stations * getattr(configs, 'estimated_cmax_station_slots', 1.0))
-        self.ideal_makespan = self.total_base_workload / max(1.0, slots)
+        # 结合平均法和 CPM 法：max(C_CPM, Sum(Duration_i) / Num_Stations)
+        sum_durations = torch.sum(dur).item()
+        avg_makespan = sum_durations / max(1.0, float(self.num_stations))
+        self.ideal_makespan = max(float(cpm_makespan), avg_makespan)
         
         self.base_data = data
         self.obs_data = None # 将在 reset 中 clone
@@ -365,7 +424,7 @@ class AirLineEnv_Graph(gym.Env):
             
         # [关键路径计算 (CPM)]
         # 用于后续计算 Blocking Penalty
-        self.is_critical = self._calculate_cpm()
+        self.is_critical, _ = self._calculate_cpm()
         
         return self._get_observation()
 
@@ -417,7 +476,7 @@ class AirLineEnv_Graph(gym.Env):
         # 4. 判定关键任务
         slack = ls - es
         is_critical = (slack < 1e-5)
-        return is_critical
+        return is_critical, max_makespan
 
     def _calculate_max_allowed_stations(self):
         """
@@ -617,8 +676,13 @@ class AirLineEnv_Graph(gym.Env):
         delta_std = curr_std - prev_std
         
         # [Scale Invariance] Reward Reshaping
-        norm_delta_makespan = delta_makespan / self.mean_task_time
-        norm_delta_std = delta_std / max(1.0, self.ideal_station_load)
+        # 修复 vloss 尖峰：分母改为理想总完工时间 (ideal_makespan)
+        # 这样无论图大小，整个 episode 累积的 makespan_reward 总和都稳定在 -1.0 到 -2.0 左右 (即完工时间是理想时间的几倍)
+        # 乘以 100.0 是为了保持单步数值量级与之前相近，防止之前配置的 reward_scale 过小导致梯度消失
+        norm_delta_makespan = (delta_makespan / max(1e-5, self.ideal_makespan)) * 100.0
+        
+        # 负载方差原本就除以了 ideal_station_load（随数据集大小等比放大），原理正确，只需同样乘 100 保持系数平衡
+        norm_delta_std = (delta_std / max(1.0, self.ideal_station_load)) * 100.0
         
         coef_makespan = configs.r_coef_makespan
         coef_std = configs.r_coef_std
@@ -865,18 +929,23 @@ class AirLineEnv_Graph(gym.Env):
             'current_time': self.current_time,
             'assigned_tasks': copy.deepcopy(self.assigned_tasks),
             'base_worker_x': self.base_worker_x.clone(),
-            'can_do_edge_index': self.obs_data['worker', 'can_do', 'task'].edge_index.clone()
+            'can_do_edge_index': self.obs_data['worker', 'can_do', 'task'].edge_index.clone(),
+            'dataset_idx': getattr(self, 'active_dataset_idx', 0)
         }
         
     def rebuild_state_from_snapshot(self, snapshot):
         """
         基于快照恢复成 PyG 图结构，避免完整异构图深拷贝带来的极高缓存占用。
         """
-        data = self.base_data.clone()
+        # 溯源：找到生成该快照时的底层骨架上下文，免疫维度错位崩溃
+        ctx_idx = snapshot.get('dataset_idx', 0)
+        ctx = self.dataset_pool[ctx_idx]
         
-        task_x = self.base_task_x.clone()
+        data = ctx['base_data'].clone()
+        
+        task_x = ctx['base_task_x'].clone()
         task_x[:, 1:5] = 0.0
-        task_x[torch.arange(self.num_tasks), snapshot['task_status'] + 1] = 1.0
+        task_x[torch.arange(ctx['num_tasks']), snapshot['task_status'] + 1] = 1.0
         data['task'].x = task_x
         
         snap_num_workers = len(snapshot['worker_free_time'])
@@ -884,7 +953,7 @@ class AirLineEnv_Graph(gym.Env):
         
         # [Feature Upgrade: Wait time rebuild]
         wait_times_w = np.maximum(0, snapshot['worker_free_time'] - snapshot['current_time'])
-        worker_x[:, 11] = torch.tensor(wait_times_w, dtype=torch.float) / self.mean_task_time
+        worker_x[:, 11] = torch.tensor(wait_times_w, dtype=torch.float) / ctx['mean_task_time']
         
         is_free_bool = (snapshot['worker_free_time'] <= snapshot['current_time'])
         worker_x[:, 12] = torch.tensor(is_free_bool, dtype=torch.float)
@@ -897,8 +966,8 @@ class AirLineEnv_Graph(gym.Env):
         data['worker'].x = worker_x
         data['worker', 'can_do', 'task'].edge_index = snapshot['can_do_edge_index'].clone()
         
-        station_x = self.base_station_x.clone()
-        station_x[:, 0] = torch.tensor(snapshot['station_loads'], dtype=torch.float) / max(1.0, self.ideal_station_load)
+        station_x = ctx['base_station_x'].clone()
+        station_x[:, 0] = torch.tensor(snapshot['station_loads'], dtype=torch.float) / max(1.0, ctx['ideal_station_load'])
         
         # [Feature Upgrade: Wait time rebuild]
         max_slots = getattr(configs, 'max_slots_per_station', 15)

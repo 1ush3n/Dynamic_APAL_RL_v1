@@ -175,12 +175,14 @@ def train(args):
         if not os.path.exists(data_path) and os.path.exists(os.path.join(os.getcwd(), data_path)):
              data_path = os.path.join(os.getcwd(), data_path)
              
-        print(f"数据路径: {data_path}")
-        # 固定种子以保证训练环境的一致性 (Determinism)
-        env = AirLineEnv_Graph(data_path=data_path, seed=42)
+        # [Dataset Pool] 训练环境：直接投喂整个多图混合训练集目录
+        train_dir = getattr(configs, 'train_data_path_or_dir', data_path)
+        print(f"训练图纸池 (Dataset Pool): {train_dir}")
+        env = AirLineEnv_Graph(data_path_or_dir=train_dir, seed=42)
         
-        # [Validation] 单独开辟一个确定性验证环境，防止其污染训练轨迹状态
-        eval_env = AirLineEnv_Graph(data_path=data_path, seed=2026)
+        # [Validation] 验证环境：绑定单一的稳定基准图，防止评估基准浮动
+        print(f"基准评估图 (Eval Graph): {data_path}")
+        eval_env = AirLineEnv_Graph(data_path_or_dir=data_path, seed=2026)
         print("环境初始化完成.")
         
         # 2. 初始化设备与模型
@@ -430,6 +432,15 @@ def train(args):
                         raise e
                 finally:
                     memory.clear()
+                    
+                # [Dataset Pool] 交替课程学习：按设定的 PPO Update 频率切换图纸
+                current_update_count = ep // update_every_episodes
+                if current_update_count % getattr(configs, 'switch_dataset_every_updates', 1) == 0:
+                    if len(env.dataset_pool) > 1:
+                        import random
+                        next_idx = random.randint(0, len(env.dataset_pool) - 1)
+                        env.switch_dataset(next_idx)
+                        print(f"      🔄 [Alternating Training] 已切图至: {env.dataset_pool[next_idx]['file_path']} (Nodes: {env.num_tasks})")
                 
             # 定期评估与保存
               # [Validation Strategy]
